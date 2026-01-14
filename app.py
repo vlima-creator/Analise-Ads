@@ -17,50 +17,95 @@ with st.sidebar:
     acos_bom = st.number_input("ACOS bom", min_value=0.0, max_value=1.0, value=0.12, step=0.01)
     acos_atencao = st.number_input("ACOS atenção", min_value=0.0, max_value=1.0, value=0.18, step=0.01)
 
-# ========= Helpers =========
+# ================= Helpers =================
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
-    # remove colunas tipo "Unnamed: 0"
     df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
     return df
 
-def read_xlsx_auto_header(f, required_keywords=None, max_scan_rows=40) -> pd.DataFrame:
+def _row_to_text(row: pd.Series) -> str:
+    parts = []
+    for x in row.tolist():
+        if pd.notna(x):
+            s = str(x).strip()
+            if s:
+                parts.append(s)
+    return " ".join(parts)
+
+def _find_best_header_row(preview: pd.DataFrame, required_keywords: list[str]) -> int:
     """
-    Lê XLSX detectando automaticamente a linha de cabeçalho.
-    Resolve exports do ML que trazem linhas acima do header e geram "Unnamed: X".
+    Escolhe a linha que mais parece cabeçalho:
+    - muitas células preenchidas
+    - muitas palavras-chave
+    - evita linhas com uma frase única tipo "Confira em detalhes..."
     """
-    # tentativa 1: leitura normal
-    try:
-        df = pd.read_excel(f)
-        df = _clean_columns(df)
-        if df.shape[1] > 1 and not all(str(c).startswith("Unnamed") for c in df.columns):
-            return df
-    except Exception:
-        pass
-
-    # tentativa 2: procurar linha do header
-    preview = pd.read_excel(f, header=None, nrows=max_scan_rows)
-
-    def row_text(r):
-        return " ".join([str(x).strip() for x in r.tolist() if pd.notna(x)])
-
-    if not required_keywords:
-        required_keywords = ["Campanha", "Impress", "Cliq", "Invest", "Receita", "ACOS", "ROAS", "anúncio", "anuncio"]
-
-    best_row = 0
+    best_i = 0
     best_score = -1
+
     for i in range(len(preview)):
-        text = row_text(preview.iloc[i]).lower()
-        score = sum(1 for kw in required_keywords if kw.lower() in text)
+        row = preview.iloc[i]
+        text = _row_to_text(row).lower()
+
+        non_empty = sum(1 for x in row.tolist() if pd.notna(x) and str(x).strip() != "")
+        kw_hits = sum(1 for kw in required_keywords if kw.lower() in text)
+
+        # Penaliza linhas com 1 célula preenchida (geralmente título/capa)
+        penalty = 3 if non_empty <= 1 else 0
+
+        score = (kw_hits * 10) + non_empty - penalty
+
         if score > best_score:
             best_score = score
-            best_row = i
+            best_i = i
 
-    df = pd.read_excel(f, header=best_row)
-    df = _clean_columns(df)
-    df = df.dropna(how="all")
-    return df
+    return best_i
+
+def read_xlsx_smart(f, required_keywords=None, max_scan_rows=60) -> pd.DataFrame:
+    """
+    Lê XLSX de um jeito mais inteligente:
+    - testa todas as abas
+    - em cada aba, procura a melhor linha de header
+    - escolhe a combinação (aba + header) que gera mais colunas úteis
+    """
+    if required_keywords is None:
+        required_keywords = ["campanha", "anúncio", "anuncio", "impress", "cliq", "invest", "receita", "acos", "roas"]
+
+    xls = pd.ExcelFile(f)
+    best_df = None
+    best_cols = -1
+
+    for sheet in xls.sheet_names:
+        try:
+            preview = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=max_scan_rows)
+            header_row = _find_best_header_row(preview, required_keywords)
+
+            df = pd.read_excel(xls, sheet_name=sheet, header=header_row)
+            df = _clean_columns(df)
+            df = df.dropna(how="all")
+
+            # ignora caso ainda esteja ruim (poucas colunas ou colunas com frase única)
+            if df.shape[1] <= 2:
+                continue
+
+            # evita situação em que a "coluna" é uma frase só
+            if df.shape[1] == 1:
+                continue
+
+            if df.shape[1] > best_cols:
+                best_cols = df.shape[1]
+                best_df = df
+
+        except Exception:
+            continue
+
+    if best_df is None:
+        # fallback simples
+        df = pd.read_excel(f)
+        df = _clean_columns(df)
+        return df
+
+    return best_df
 
 def ensure_cols(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     cols = df.columns.tolist()
@@ -88,34 +133,24 @@ def acao_por_status(status: str) -> str:
 def brl(x: float) -> str:
     return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ========= Upload validation =========
+# ================= Upload validation =================
 
 if not all([camp_file, esp_file, ads_file]):
     st.info("Envie os 3 relatórios para gerar a análise.")
     st.stop()
 
-# ========= Read files with auto header =========
+# ================= Read files (smart) =================
 
-camp = read_xlsx_auto_header(
-    camp_file,
-    required_keywords=["Campanha", "Orçamento", "ACOS", "Impress", "Cliq", "Invest", "Receita"]
-)
-esp = read_xlsx_auto_header(
-    esp_file,
-    required_keywords=["Espaço", "Espaco", "Impress", "Cliq", "Invest", "Vendas", "Receita"]
-)
-ads = read_xlsx_auto_header(
-    ads_file,
-    required_keywords=["Campanha", "anúncio", "anuncio", "Impress", "Cliq", "Invest", "Receita", "ACOS", "ROAS"]
-)
+camp = read_xlsx_smart(camp_file, required_keywords=["campanha", "orçamento", "acos", "impress", "cliq", "invest", "receita"])
+esp = read_xlsx_smart(esp_file, required_keywords=["espaço", "espaco", "impress", "cliq", "invest", "vendas", "receita"])
+ads = read_xlsx_smart(ads_file, required_keywords=["campanha", "anúncio", "anuncio", "impress", "cliq", "invest", "receita", "acos", "roas"])
 
-# ========= Normalize columns =========
+# ================= Normalize columns =================
 
-# Ads (Anúncios patrocinados)
 ads = ensure_cols(ads, {
     "ID do anúncio": "id_anuncio",
-    "ID_Anuncio": "id_anuncio",
     "Id do anúncio": "id_anuncio",
+    "ID_Anuncio": "id_anuncio",
     "Nome da campanha": "campanha",
     "Campanha": "campanha",
     "Impressões": "impressoes",
@@ -131,7 +166,6 @@ ads = ensure_cols(ads, {
     "ROAS": "roas",
 })
 
-# Campanhas
 camp = ensure_cols(camp, {
     "Nome da campanha": "campanha",
     "Campanha": "campanha",
@@ -140,15 +174,8 @@ camp = ensure_cols(camp, {
     "ACOS Objetivo": "acos_objetivo",
     "ACOS objetivo": "acos_objetivo",
     "ACOS": "acos_campanha",
-    "Investimento": "investimento_campanha",
-    "Receita": "receita_campanha",
-    "Vendas por Product Ads": "vendas_ads_campanha",
-    "Vendas": "vendas_ads_campanha",
-    "Impressões": "impressoes_campanha",
-    "Cliques": "cliques_campanha",
 })
 
-# Espaços
 esp = ensure_cols(esp, {
     "Espaço de publicidade": "espaco",
     "Espaco de publicidade": "espaco",
@@ -164,14 +191,18 @@ esp = ensure_cols(esp, {
     "Receita": "receita_ads",
 })
 
-# ========= Required checks =========
+# ================= Required checks =================
 
-required_ads = {"id_anuncio", "campanha", "impressoes", "cliques", "investimento", "receita_ads"}
+required_ads = {"campanha", "impressoes", "cliques", "investimento", "receita_ads"}
 missing_ads = required_ads - set(ads.columns)
 if missing_ads:
     st.error(f"Relatório de Anúncios Patrocinados não tem colunas essenciais: {sorted(missing_ads)}")
     st.write("Colunas encontradas:", list(ads.columns))
     st.stop()
+
+# id_anuncio pode não existir dependendo do tipo de exportação
+if "id_anuncio" not in ads.columns:
+    ads["id_anuncio"] = ""
 
 required_esp = {"espaco", "investimento", "receita_ads"}
 missing_esp = required_esp - set(esp.columns)
@@ -187,22 +218,21 @@ if "acos" not in ads.columns:
 if "roas" not in ads.columns:
     ads["roas"] = (ads["receita_ads"].fillna(0) / ads["investimento"].replace({0: pd.NA})).fillna(0)
 
-# ========= Base consolidada por anúncio =========
+# ================= Base consolidada por anúncio =================
 
 base = ads.copy()
-
 base["ctr"] = (base["cliques"].fillna(0) / base["impressoes"].replace({0: pd.NA})).fillna(0)
 base["status"] = base["acos"].apply(status_por_acos)
 base["acao_recomendada"] = base["status"].apply(acao_por_status)
 
-# Enriquecer com dados do relatório de campanhas (se existir campanha)
+# Enriquecer com dados do relatório de campanhas
 if "campanha" in camp.columns:
     camp_cols = [c for c in ["campanha", "orcamento_diario", "acos_objetivo", "acos_campanha"] if c in camp.columns]
     if camp_cols:
         camp_unique = camp[camp_cols].drop_duplicates(subset=["campanha"])
         base = base.merge(camp_unique, on="campanha", how="left")
 
-# ========= Análise por campanha (a partir dos anúncios) =========
+# ================= Campanhas (a partir dos anúncios) =================
 
 camp_agg = base.groupby("campanha", dropna=False).agg(
     investimento_total=("investimento", "sum"),
@@ -217,9 +247,8 @@ camp_agg["ctr"] = (camp_agg["cliques"] / camp_agg["impressoes"].replace({0: pd.N
 camp_agg["status"] = camp_agg["acos"].apply(status_por_acos)
 camp_agg["acao_recomendada"] = camp_agg["status"].apply(acao_por_status)
 
-# ========= Análise por espaço =========
+# ================= Espaços =================
 
-# se impressoes/cliques não existirem no esp, cria colunas dummy para não quebrar
 if "impressoes" not in esp.columns:
     esp["impressoes"] = 0
 if "cliques" not in esp.columns:
@@ -238,7 +267,7 @@ esp_group["ctr"] = (esp_group["cliques"] / esp_group["impressoes"].replace({0: p
 esp_group["status"] = esp_group["acos"].apply(status_por_acos)
 esp_group["acao_recomendada"] = esp_group["status"].apply(acao_por_status)
 
-# ========= KPIs =========
+# ================= KPIs =================
 
 c1, c2, c3, c4 = st.columns(4)
 invest_total = float(base["investimento"].fillna(0).sum())
@@ -251,7 +280,7 @@ c2.metric("Receita Ads", brl(receita_ads_total))
 c3.metric("ACOS Global", f"{acos_global:.2%}".replace(".", ","))
 c4.metric("ROAS Global", f"{roas_global:.2f}".replace(".", ","))
 
-# ========= UI =========
+# ================= UI =================
 
 tab1, tab2, tab3 = st.tabs(["Anúncios", "Campanhas", "Espaços"])
 
