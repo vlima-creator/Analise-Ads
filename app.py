@@ -17,8 +17,50 @@ with st.sidebar:
     acos_bom = st.number_input("ACOS bom", min_value=0.0, max_value=1.0, value=0.12, step=0.01)
     acos_atencao = st.number_input("ACOS atenção", min_value=0.0, max_value=1.0, value=0.18, step=0.01)
 
-def read_xlsx(f) -> pd.DataFrame:
-    return pd.read_excel(f)
+# ========= Helpers =========
+
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).strip() for c in df.columns]
+    # remove colunas tipo "Unnamed: 0"
+    df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
+    return df
+
+def read_xlsx_auto_header(f, required_keywords=None, max_scan_rows=40) -> pd.DataFrame:
+    """
+    Lê XLSX detectando automaticamente a linha de cabeçalho.
+    Resolve exports do ML que trazem linhas acima do header e geram "Unnamed: X".
+    """
+    # tentativa 1: leitura normal
+    try:
+        df = pd.read_excel(f)
+        df = _clean_columns(df)
+        if df.shape[1] > 1 and not all(str(c).startswith("Unnamed") for c in df.columns):
+            return df
+    except Exception:
+        pass
+
+    # tentativa 2: procurar linha do header
+    preview = pd.read_excel(f, header=None, nrows=max_scan_rows)
+
+    def row_text(r):
+        return " ".join([str(x).strip() for x in r.tolist() if pd.notna(x)])
+
+    if not required_keywords:
+        required_keywords = ["Campanha", "Impress", "Cliq", "Invest", "Receita", "ACOS", "ROAS", "anúncio", "anuncio"]
+
+    best_row = 0
+    best_score = -1
+    for i in range(len(preview)):
+        text = row_text(preview.iloc[i]).lower()
+        score = sum(1 for kw in required_keywords if kw.lower() in text)
+        if score > best_score:
+            best_score = score
+            best_row = i
+
+    df = pd.read_excel(f, header=best_row)
+    df = _clean_columns(df)
+    df = df.dropna(how="all")
+    return df
 
 def ensure_cols(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     cols = df.columns.tolist()
@@ -43,30 +85,48 @@ def acao_por_status(status: str) -> str:
         return "Reduzir verba e corrigir oferta"
     return ""
 
+def brl(x: float) -> str:
+    return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# ========= Upload validation =========
+
 if not all([camp_file, esp_file, ads_file]):
     st.info("Envie os 3 relatórios para gerar a análise.")
     st.stop()
 
-camp = read_xlsx(camp_file)
-esp = read_xlsx(esp_file)
-ads = read_xlsx(ads_file)
+# ========= Read files with auto header =========
 
-# ====== Normalização de colunas (ajuste aqui se algum nome vier diferente) ======
-# Anúncios patrocinados
+camp = read_xlsx_auto_header(
+    camp_file,
+    required_keywords=["Campanha", "Orçamento", "ACOS", "Impress", "Cliq", "Invest", "Receita"]
+)
+esp = read_xlsx_auto_header(
+    esp_file,
+    required_keywords=["Espaço", "Espaco", "Impress", "Cliq", "Invest", "Vendas", "Receita"]
+)
+ads = read_xlsx_auto_header(
+    ads_file,
+    required_keywords=["Campanha", "anúncio", "anuncio", "Impress", "Cliq", "Invest", "Receita", "ACOS", "ROAS"]
+)
+
+# ========= Normalize columns =========
+
+# Ads (Anúncios patrocinados)
 ads = ensure_cols(ads, {
     "ID do anúncio": "id_anuncio",
     "ID_Anuncio": "id_anuncio",
-    "Campanha": "campanha",
+    "Id do anúncio": "id_anuncio",
     "Nome da campanha": "campanha",
+    "Campanha": "campanha",
     "Impressões": "impressoes",
     "Impressoes": "impressoes",
     "Cliques": "cliques",
     "Investimento": "investimento",
     "Custo": "investimento",
-    "Vendas": "vendas_ads",
-    "Vendas_Ads": "vendas_ads",
     "Receita": "receita_ads",
     "Receita_Ads": "receita_ads",
+    "Vendas": "vendas_ads",
+    "Vendas_Ads": "vendas_ads",
     "ACOS": "acos",
     "ROAS": "roas",
 })
@@ -88,9 +148,10 @@ camp = ensure_cols(camp, {
     "Cliques": "cliques_campanha",
 })
 
-# Espaços de publicidade
+# Espaços
 esp = ensure_cols(esp, {
     "Espaço de publicidade": "espaco",
+    "Espaco de publicidade": "espaco",
     "Espaco_Publicidade": "espaco",
     "Impressões": "impressoes",
     "Impressoes": "impressoes",
@@ -103,7 +164,8 @@ esp = ensure_cols(esp, {
     "Receita": "receita_ads",
 })
 
-# ====== Checagens mínimas ======
+# ========= Required checks =========
+
 required_ads = {"id_anuncio", "campanha", "impressoes", "cliques", "investimento", "receita_ads"}
 missing_ads = required_ads - set(ads.columns)
 if missing_ads:
@@ -118,27 +180,30 @@ if missing_esp:
     st.write("Colunas encontradas:", list(esp.columns))
     st.stop()
 
+# cria ACOS/ROAS se não existirem
 if "acos" not in ads.columns:
     ads["acos"] = (ads["investimento"].fillna(0) / ads["receita_ads"].replace({0: pd.NA})).fillna(0)
 
 if "roas" not in ads.columns:
     ads["roas"] = (ads["receita_ads"].fillna(0) / ads["investimento"].replace({0: pd.NA})).fillna(0)
 
-# ====== BASE CONSOLIDADA (anúncios) ======
+# ========= Base consolidada por anúncio =========
+
 base = ads.copy()
 
 base["ctr"] = (base["cliques"].fillna(0) / base["impressoes"].replace({0: pd.NA})).fillna(0)
 base["status"] = base["acos"].apply(status_por_acos)
 base["acao_recomendada"] = base["status"].apply(acao_por_status)
 
-# Enriquecer com dados do relatório de campanhas (se possível)
+# Enriquecer com dados do relatório de campanhas (se existir campanha)
 if "campanha" in camp.columns:
     camp_cols = [c for c in ["campanha", "orcamento_diario", "acos_objetivo", "acos_campanha"] if c in camp.columns]
     if camp_cols:
         camp_unique = camp[camp_cols].drop_duplicates(subset=["campanha"])
         base = base.merge(camp_unique, on="campanha", how="left")
 
-# ====== ANÁLISE POR CAMPANHA (a partir dos anúncios) ======
+# ========= Análise por campanha (a partir dos anúncios) =========
+
 camp_agg = base.groupby("campanha", dropna=False).agg(
     investimento_total=("investimento", "sum"),
     receita_ads_total=("receita_ads", "sum"),
@@ -152,45 +217,52 @@ camp_agg["ctr"] = (camp_agg["cliques"] / camp_agg["impressoes"].replace({0: pd.N
 camp_agg["status"] = camp_agg["acos"].apply(status_por_acos)
 camp_agg["acao_recomendada"] = camp_agg["status"].apply(acao_por_status)
 
-# ====== ANÁLISE POR ESPAÇO ======
+# ========= Análise por espaço =========
+
+# se impressoes/cliques não existirem no esp, cria colunas dummy para não quebrar
+if "impressoes" not in esp.columns:
+    esp["impressoes"] = 0
+if "cliques" not in esp.columns:
+    esp["cliques"] = 0
+
 esp_group = esp.groupby("espaco", dropna=False).agg(
     investimento_total=("investimento", "sum"),
     receita_total=("receita_ads", "sum"),
-    impressoes=("impressoes", "sum") if "impressoes" in esp.columns else ("investimento", "size"),
-    cliques=("cliques", "sum") if "cliques" in esp.columns else ("investimento", "size"),
+    impressoes=("impressoes", "sum"),
+    cliques=("cliques", "sum"),
 ).reset_index()
 
 esp_group["acos"] = (esp_group["investimento_total"] / esp_group["receita_total"].replace({0: pd.NA})).fillna(0)
 esp_group["roas"] = (esp_group["receita_total"] / esp_group["investimento_total"].replace({0: pd.NA})).fillna(0)
+esp_group["ctr"] = (esp_group["cliques"] / esp_group["impressoes"].replace({0: pd.NA})).fillna(0)
 esp_group["status"] = esp_group["acos"].apply(status_por_acos)
 esp_group["acao_recomendada"] = esp_group["status"].apply(acao_por_status)
 
-# ====== KPIs ======
+# ========= KPIs =========
+
 c1, c2, c3, c4 = st.columns(4)
 invest_total = float(base["investimento"].fillna(0).sum())
 receita_ads_total = float(base["receita_ads"].fillna(0).sum())
 acos_global = (invest_total / receita_ads_total) if receita_ads_total else 0
 roas_global = (receita_ads_total / invest_total) if invest_total else 0
 
-def brl(x: float) -> str:
-    return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
 c1.metric("Investimento (Ads)", brl(invest_total))
 c2.metric("Receita Ads", brl(receita_ads_total))
 c3.metric("ACOS Global", f"{acos_global:.2%}".replace(".", ","))
 c4.metric("ROAS Global", f"{roas_global:.2f}".replace(".", ","))
 
-# ====== TABS ======
+# ========= UI =========
+
 tab1, tab2, tab3 = st.tabs(["Anúncios", "Campanhas", "Espaços"])
 
 with tab1:
     st.subheader("Base consolidada por anúncio")
     cols = [
-        "campanha","id_anuncio",
-        "impressoes","cliques","ctr",
-        "investimento","receita_ads","acos","roas",
-        "status","acao_recomendada",
-        "orcamento_diario","acos_objetivo","acos_campanha"
+        "campanha", "id_anuncio",
+        "impressoes", "cliques", "ctr",
+        "investimento", "receita_ads", "acos", "roas",
+        "status", "acao_recomendada",
+        "orcamento_diario", "acos_objetivo", "acos_campanha"
     ]
     cols = [c for c in cols if c in base.columns]
     st.dataframe(base[cols], use_container_width=True)
@@ -204,7 +276,7 @@ with tab1:
 
 with tab2:
     st.subheader("Análise consolidada por campanha (a partir dos anúncios)")
-    cols = ["campanha","investimento_total","receita_ads_total","acos","roas","ctr","status","acao_recomendada"]
+    cols = ["campanha", "investimento_total", "receita_ads_total", "acos", "roas", "ctr", "status", "acao_recomendada"]
     st.dataframe(camp_agg[cols], use_container_width=True)
 
     st.download_button(
@@ -216,7 +288,7 @@ with tab2:
 
 with tab3:
     st.subheader("Análise por espaço de publicidade")
-    cols = ["espaco","investimento_total","receita_total","acos","roas","status","acao_recomendada"]
+    cols = ["espaco", "investimento_total", "receita_total", "acos", "roas", "ctr", "status", "acao_recomendada"]
     st.dataframe(esp_group[cols], use_container_width=True)
 
     st.download_button(
